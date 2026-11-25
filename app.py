@@ -1,17 +1,10 @@
 import streamlit as st
 import pandas as pd
-import json
 import io
-import smtplib
 from datetime import date, datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# Generación de PDFs idénticos a las planillas oficiales de Transnea
+# Generación de PDFs oficiales de Transnea
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -95,16 +88,19 @@ DIAS_SEMANA_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado
 @st.cache_resource
 def get_supabase():
     if SUPABASE_OK and "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
-        return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+        return create_client(str(st.secrets["SUPABASE_URL"]).strip(), str(st.secrets["SUPABASE_KEY"]).strip())
     return None
 
 sb = get_supabase()
 
 def get_config():
     if sb:
-        res = sb.table("config_viaticos").select("*").eq("id", 1).execute()
-        if res.data:
-            return res.data[0]
+        try:
+            res = sb.table("config_viaticos").select("*").eq("id", 1).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            st.error(f"Error leyendo config_viaticos en Supabase: {e}")
     return {
         "valor_viatico_diario": 55210.00,
         "ultimo_nro_comision": 154,
@@ -127,64 +123,65 @@ def parsear_excel_mapro(file_bytes, semana_fallback, anio_fallback):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb["LAT"] if "LAT" in wb.sheetnames else wb.active
 
-    sem_val = ws["D4"].value or semana_fallback
-    anio_val = ws["E4"].value or anio_fallback
+    sem_val = ws["D4"].value
     try:
-        sem_int = int(sem_val)
+        sem_int = int(float(sem_val)) if sem_val is not None else int(semana_fallback)
     except Exception:
         sem_int = int(semana_fallback)
-    try:
-        anio_int = int(anio_val)
-    except Exception:
-        anio_int = int(anio_fallback)
+
+    anio_int = int(anio_fallback)
 
     registros = []
-    # Leer tabla principal (columnas B a R, filas 9 a 50)
     fecha_actual = None
     for r in range(9, 55):
-        val_b = ws.cell(r, 2).value  # Día o Fecha
-        lat_v = ws.cell(r, 3).value  # LAT
+        val_b = ws.cell(r, 2).value
+        lat_v = ws.cell(r, 3).value
+
         if isinstance(val_b, datetime):
             fecha_actual = val_b.date()
         elif isinstance(val_b, date):
             fecha_actual = val_b
 
-        if lat_v and str(lat_v).strip() not in ["", "0", "00:00:00"]:
-            tct_si = str(ws.cell(r, 4).value or "").strip().upper()
-            tct_flag = "SI" if tct_si == "X" else "NO"
-            eq_cammesa = str(ws.cell(r, 6).value or "").strip()
-            h_desde = str(ws.cell(r, 8).value or "07:00")[:5]
-            h_hasta = str(ws.cell(r, 9).value or "14:00")[:5]
-            t_rep = str(ws.cell(r, 10).value or "1 hora").strip()
-            j_cons = str(ws.cell(r, 11).value or "MAIDANA WALTER").strip().upper()
-            j_trab = str(ws.cell(r, 12).value or "").strip().upper()
-            tipo_mto = str(ws.cell(r, 13).value or "Preventivo Semanal/Diario").strip()
-            ot_num = str(ws.cell(r, 14).value or "").strip()
-            tarea = str(ws.cell(r, 18).value or "").strip()
+        if lat_v is not None:
+            lat_str = str(lat_v).strip().upper()
+            if lat_str and lat_str not in ["0", "00:00:00", "NONE", "NAN"]:
+                tct_si = str(ws.cell(r, 4).value or "").strip().upper()
+                tct_flag = "SI" if tct_si == "X" else "NO"
+                eq_cammesa = str(ws.cell(r, 6).value or "").strip()
+                h_desde = str(ws.cell(r, 8).value or "07:00")[:5]
+                h_hasta = str(ws.cell(r, 9).value or "14:00")[:5]
+                t_rep = str(ws.cell(r, 10).value or "1 hora").strip()
+                j_cons = str(ws.cell(r, 11).value or "MAIDANA WALTER").strip().upper()
+                j_trab = str(ws.cell(r, 12).value or "SIN ASIGNAR").strip().upper()
+                tipo_mto = str(ws.cell(r, 13).value or "Preventivo Semanal/Diario").strip()
+                ot_raw = ws.cell(r, 14).value
+                ot_num = "" if ot_raw is None else str(ot_raw).strip()
+                tarea_raw = ws.cell(r, 18).value
+                tarea = str(tarea_raw).strip() if tarea_raw is not None and str(tarea_raw).strip() else "Mantenimiento programado LAT"
 
-            f_usar = fecha_actual or lunes_de_semana_iso(anio_int, sem_int)
-            dia_nombre = DIAS_SEMANA_ES[f_usar.weekday()]
+                f_usar = fecha_actual if isinstance(fecha_actual, date) else lunes_de_semana_iso(anio_int, sem_int)
+                dia_nombre = DIAS_SEMANA_ES[f_usar.weekday()]
 
-            registros.append({
-                "id_semana": f"{sem_int}-{anio_int}",
-                "semana": sem_int,
-                "anio": anio_int,
-                "fecha": str(f_usar),
-                "dia": dia_nombre,
-                "lat": str(lat_v).strip().upper(),
-                "tct": tct_flag,
-                "equipo_cammesa": eq_cammesa,
-                "horario_desde": h_desde,
-                "horario_hasta": h_hasta,
-                "tiempo_reposicion": t_rep,
-                "jefe_consigna": j_cons,
-                "jefe_trabajo": j_trab,
-                "tipo_mto": tipo_mto,
-                "tarea": tarea,
-                "ot_num": ot_num,
-                "requiere_comision": True,
-                "comision_generada": False
-            })
+                registros.append({
+                    "id_semana": f"{sem_int}-{anio_int}",
+                    "semana": int(sem_int),
+                    "anio": int(anio_int),
+                    "fecha": f_usar.isoformat(),
+                    "dia": str(dia_nombre),
+                    "lat": lat_str,
+                    "tct": tct_flag,
+                    "equipo_cammesa": eq_cammesa,
+                    "horario_desde": h_desde,
+                    "horario_hasta": h_hasta,
+                    "tiempo_reposicion": t_rep,
+                    "jefe_consigna": j_cons,
+                    "jefe_trabajo": j_trab,
+                    "tipo_mto": tipo_mto,
+                    "tarea": tarea,
+                    "ot_num": ot_num,
+                    "requiere_comision": True,
+                    "comision_generada": False
+                })
 
     return sem_int, anio_int, registros
 
@@ -201,7 +198,6 @@ def generar_pdf_comision(com: dict, solicitante: str, autorizante: str) -> bytes
     st_sub = ParagraphStyle("T2", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=9.5, textColor=colors.HexColor("#1E293B"))
     st_small = ParagraphStyle("T3", parent=styles["Normal"], fontName="Helvetica", fontSize=8, textColor=colors.black)
 
-    # Encabezado oficial
     story.append(Paragraph("TRANSNEA S.A. — COMISIONES DE SERVICIO", st_title))
     story.append(Paragraph("PERSONAL MANTENIMIENTO DE LÍNEAS", st_sub))
     story.append(Spacer(1, 8))
@@ -211,7 +207,6 @@ def generar_pdf_comision(com: dict, solicitante: str, autorizante: str) -> bytes
     cant_ag = len(com["agentes_json"])
     cant_letras = NUMEROS_LETRAS.get(cant_ag, str(cant_ag))
 
-    # Tabla superior de metadatos (igual al Excel Comision ORELLANA.xlsx)
     meta_data = [
         ["SEMANA:", str(com["semana"]), "NÚMERO DE COMISIÓN:", f"{com['nro_comision']} / {com['anio']}", "FECHA EMISIÓN:", f_emision],
         ["LAT / E.T.:", com["lat"], "Cuadrilla Base:", com["cuadrilla_base"], "Cant. Días:", f"{float(com['cant_dias']):.1f}".replace(".", ",")],
@@ -241,7 +236,6 @@ def generar_pdf_comision(com: dict, solicitante: str, autorizante: str) -> bytes
     story.append(t_meta)
     story.append(Spacer(1, 10))
 
-    # Nómina de agentes intervinientes
     story.append(Paragraph("NÓMINA DE AGENTES INTERVINIENTES", st_sub))
     story.append(Spacer(1, 4))
 
@@ -289,7 +283,6 @@ def generar_pdf_comision(com: dict, solicitante: str, autorizante: str) -> bytes
     story.append(t_nom)
     story.append(Spacer(1, 16))
 
-    # Firmas Solicitante y Autorización
     firmas_top = Table([
         ["SOLICITANTE", "", "AUTORIZACIÓN"],
         [f"\n\n....................................................\n{solicitante}", "", f"\n\n....................................................\n{autorizante}"]
@@ -302,13 +295,12 @@ def generar_pdf_comision(com: dict, solicitante: str, autorizante: str) -> bytes
     story.append(firmas_top)
     story.append(Spacer(1, 14))
 
-    # Talones de Recibo de Viáticos por cada agente (2 columnas)
     story.append(Paragraph("RECIBOS INDIVIDUALES DE VIÁTICOS", st_sub))
     story.append(Spacer(1, 4))
 
     recibos_cells = []
     fila_actual = []
-    for idx, ag in enumerate(com["agentes_json"]):
+    for ag in com["agentes_json"]:
         tot_d = sum(ag.get("dias_detalle", [0, 1, 1, 1, 0.5]))
         imp_ag = tot_d * viatico_unit
         texto_recibo = (
@@ -336,7 +328,6 @@ def generar_pdf_comision(com: dict, solicitante: str, autorizante: str) -> bytes
     story.append(t_rec)
     story.append(Spacer(1, 10))
 
-    # Pie Total Gastos y Observaciones
     pie_data = [
         ["TOTAL GASTOS DE COMISIÓN ($):", f"$ {float(com['total_comision']):,.2f}"],
         ["OBSERVACIONES:", com.get("observaciones") or "-"]
@@ -393,7 +384,6 @@ def generar_pdf_rendicion(ren: dict, autorizante: str) -> bytes:
     story.append(t_cab)
     story.append(Spacer(1, 10))
 
-    # Desarrollo de la comisión (Salida / Llegada)
     story.append(Paragraph("DESARROLLO DE LA COMISIÓN (ITINERARIO REAL)", st_sub))
     story.append(Spacer(1, 4))
 
@@ -423,7 +413,6 @@ def generar_pdf_rendicion(ren: dict, autorizante: str) -> bytes:
     story.append(t_tr)
     story.append(Spacer(1, 12))
 
-    # Detalle de gastos de viaje (Viáticos + Peajes + Otros comprobantes)
     story.append(Paragraph("DETALLE DE GASTOS DE VIAJE Y COMPROBANTES", st_sub))
     story.append(Spacer(1, 4))
 
@@ -475,47 +464,7 @@ def generar_pdf_rendicion(ren: dict, autorizante: str) -> bytes:
     return buf.getvalue()
 
 # =============================================================================
-# 5. ENVÍO DE CORREOS AUTOMÁTICOS VÍA SMTP (OUTLOOK / OFFICE 365)
-# =============================================================================
-def enviar_correo_smtp(destinatarios_str: str, cc_str: str, asunto: str, cuerpo_texto: str, adjuntos: list):
-    if "SMTP_USER" not in st.secrets or "SMTP_PASSWORD" not in st.secrets:
-        return False, "No hay credenciales SMTP configuradas en st.secrets."
-
-    smtp_server = st.secrets.get("SMTP_SERVER", "smtp.office365.com")
-    smtp_port = int(st.secrets.get("SMTP_PORT", 587))
-    smtp_user = st.secrets["SMTP_USER"]
-    smtp_pass = st.secrets["SMTP_PASSWORD"]
-
-    msg = MIMEMultipart()
-    msg["From"] = smtp_user
-    msg["To"] = destinatarios_str
-    if cc_str:
-        msg["Cc"] = cc_str
-    msg["Subject"] = asunto
-
-    msg.attach(MIMEText(cuerpo_texto, "plain", "utf-8"))
-
-    for nombre_arch, bytes_arch in adjuntos:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(bytes_arch)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{nombre_arch}"')
-        msg.attach(part)
-
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        to_list = [x.strip() for x in destinatarios_str.replace(",", ";").split(";") if x.strip()]
-        cc_list = [x.strip() for x in cc_str.replace(",", ";").split(";") if x.strip()] if cc_str else []
-        server.sendmail(smtp_user, to_list + cc_list, msg.as_string())
-        server.quit()
-        return True, "Correo enviado exitosamente."
-    except Exception as e:
-        return False, f"Error SMTP: {e}"
-
-# =============================================================================
-# 6. INTERFAZ PRINCIPAL DE STREAMLIT
+# 5. INTERFAZ PRINCIPAL DE STREAMLIT
 # =============================================================================
 cfg = get_config()
 
@@ -527,10 +476,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if not sb:
-    st.error("⚠️ Conectá tus credenciales `SUPABASE_URL` y `SUPABASE_KEY` en `.streamlit/secrets.toml` para operar con la base de datos en tiempo real.")
+    st.error("⚠️ Conectá tus credenciales `SUPABASE_URL` y `SUPABASE_KEY` en Secrets para operar con la base de datos en tiempo real.")
     st.stop()
 
-# Selector global de Semana y Año
 c_top1, c_top2, c_top3, c_top4 = st.columns([1.2, 1.2, 1.8, 2.2])
 with c_top1:
     sem_sel = st.number_input("📅 Semana N°", min_value=1, max_value=53, value=49, step=1)
@@ -565,14 +513,18 @@ with tab_mapro:
             st.caption("Subí tu planilla `LAT - Zona Centro - SEM XX.xlsx` para cargar las tareas automáticamente.")
             file_mapro = st.file_uploader("Seleccionar archivo MAPRO (.xlsx)", type=["xlsx"], key="upl_mapro")
             if file_mapro is not None:
-                bytes_excel_mapro = file_mapro.read()
+                bytes_excel_mapro = file_mapro.getvalue()
                 s_imp, a_imp, regs_imp = parsear_excel_mapro(bytes_excel_mapro, sem_sel, anio_sel)
                 st.success(f"Detectadas **{len(regs_imp)} filas** de programación para Semana **{s_imp}-{a_imp}**.")
-                if st.button("🚀 Guardar MAPRO en Base de Datos", type="primary", use_container_width=True):
+                if st.button("🚀 Guardar MAPRO en Base de Datos", type="primary", use_container_width=True, key="btn_save_mapro_db"):
                     if regs_imp:
-                        sb.table("programacion_semanal").insert(regs_imp).execute()
-                        st.toast("¡MAPRO importada con éxito!", icon="✅")
-                        st.rerun()
+                        try:
+                            sb.table("programacion_semanal").insert(regs_imp).execute()
+                            st.toast("¡MAPRO importada con éxito!", icon="✅")
+                            st.rerun()
+                        except Exception as e_ins:
+                            st.error(f"Error al insertar en Supabase: {e_ins}")
+                            st.json(regs_imp[0])
 
     with col_add:
         with st.container(border=True):
@@ -601,26 +553,28 @@ with tab_mapro:
                 if not m_tarea.strip():
                     st.error("Ingresá la descripción de la tarea.")
                 else:
-                    sb.table("programacion_semanal").insert({
-                        "id_semana": id_semana_actual,
-                        "semana": int(sem_sel),
-                        "anio": int(anio_sel),
-                        "fecha": str(m_fecha),
-                        "dia": DIAS_SEMANA_ES[m_fecha.weekday()],
-                        "lat": m_lat,
-                        "tct": m_tct,
-                        "equipo_cammesa": "ANULACION DE RECIERRE" if m_tct == "SI" else "LICENCIA INTERNA",
-                        "jefe_consigna": m_jefe_c,
-                        "jefe_trabajo": m_jefe_t,
-                        "tarea": m_tarea.strip(),
-                        "ot_num": m_ot.strip(),
-                        "requiere_comision": m_req_com,
-                        "comision_generada": False
-                    }).execute()
-                    st.toast("Tarea agregada.", icon="✅")
-                    st.rerun()
+                    try:
+                        sb.table("programacion_semanal").insert({
+                            "id_semana": id_semana_actual,
+                            "semana": int(sem_sel),
+                            "anio": int(anio_sel),
+                            "fecha": m_fecha.isoformat(),
+                            "dia": DIAS_SEMANA_ES[m_fecha.weekday()],
+                            "lat": m_lat,
+                            "tct": m_tct,
+                            "equipo_cammesa": "ANULACION DE RECIERRE" if m_tct == "SI" else "LICENCIA INTERNA",
+                            "jefe_consigna": m_jefe_c,
+                            "jefe_trabajo": m_jefe_t,
+                            "tarea": m_tarea.strip(),
+                            "ot_num": m_ot.strip(),
+                            "requiere_comision": m_req_com,
+                            "comision_generada": False
+                        }).execute()
+                        st.toast("Tarea agregada.", icon="✅")
+                        st.rerun()
+                    except Exception as e_add:
+                        st.error(f"Error al agregar tarea: {e_add}")
 
-    # Mostrar programación cargada de la semana
     res_prog = sb.table("programacion_semanal").select("*").eq("id_semana", id_semana_actual).order("fecha").execute()
     df_prog = pd.DataFrame(res_prog.data) if res_prog.data else pd.DataFrame()
 
@@ -632,15 +586,14 @@ with tab_mapro:
             hide_index=True
         )
 
-        # Bloque de Envío de Correo MAPRO
-        with st.expander("📧 Enviar Correo de Programación Semanal (MAPRO)", expanded=False):
+        with st.expander("📋 Texto Listo para Correo MAPRO (Copiar y Pegar en Outlook)", expanded=False):
             c_em1, c_em2 = st.columns(2)
             with c_em1:
-                to_mapro = st.text_input("Para:", value=DESTINATARIOS_MAPRO_DEFAULT, key="to_mapro")
+                st.text_input("Para:", value=DESTINATARIOS_MAPRO_DEFAULT, key="to_mapro")
             with c_em2:
-                cc_mapro = st.text_input("CC:", value="Oscar Ignacio Orellana", key="cc_mapro")
+                st.text_input("CC:", value="Oscar Ignacio Orellana", key="cc_mapro")
 
-            asunto_mapro = st.text_input("Asunto:", value=f"Mapro semana {sem_sel} - LAT - Zona Centro", key="asunto_mapro")
+            st.text_input("Asunto:", value=f"Mapro semana {sem_sel} - LAT - Zona Centro", key="asunto_mapro")
 
             lineas_resumen = []
             for r in df_prog.itertuples():
@@ -654,18 +607,7 @@ with tab_mapro:
                 f"Quedamos a disposición.\nMuchas gracias.\nSaludos cordiales.\n\n"
                 f"{cfg['solicitante_default']}\nGerencia de Mantenimiento - Mantenimiento de Líneas"
             )
-            cuerpo_mapro = st.text_area("Cuerpo del correo:", value=cuerpo_default_mapro, height=200, key="body_mapro")
-
-            adj_mapro = []
-            if "bytes_excel_mapro" in locals():
-                adj_mapro.append((f"LAT - Zona Centro - SEM {sem_sel}.xlsx", bytes_excel_mapro))
-
-            if st.button("📨 Disparar Email MAPRO Ahora", type="primary", key="btn_send_mapro"):
-                ok, msg = enviar_correo_smtp(to_mapro, cc_mapro, asunto_mapro, cuerpo_mapro, adj_mapro)
-                if ok:
-                    st.success(msg)
-                else:
-                    st.warning(f"{msg} (Podés copiar el texto de arriba y pegarlo en Outlook).")
+            st.text_area("Cuerpo del correo:", value=cuerpo_default_mapro, height=200, key="body_mapro")
 
 # =============================================================================
 # PESTAÑA 2: DISPARAR COMISIONES DE SERVICIO Y GENERAR PDFs
@@ -680,7 +622,6 @@ with tab_comisiones:
     if df_pend.empty:
         st.info("No hay tareas cargadas con comisión pendiente para esta semana. Importá o cargá la MAPRO en la pestaña 1.")
     else:
-        # Agrupar por Jefe de Trabajo y LAT
         grupos = df_pend.groupby(["jefe_trabajo", "lat"], as_index=False).agg({
             "tarea": lambda x: " / ".join(sorted(set(x))),
             "jefe_consigna": "first",
@@ -735,7 +676,6 @@ with tab_comisiones:
                 if not agentes_sel:
                     st.error("Seleccioná al menos 1 agente en la nómina.")
                 else:
-                    # Construir detalle diario estándar según cant_dias_com
                     if cant_dias_com == 4.5:
                         d_det = [1, 1, 1, 1, 0.5]
                     elif cant_dias_com == 3.5:
@@ -751,8 +691,8 @@ with tab_comisiones:
                         "anio": int(anio_sel),
                         "id_semana": id_semana_actual,
                         "semana": int(sem_sel),
-                        "fecha_emision": str(f_emision_com),
-                        "inicio_semana": str(f_lunes),
+                        "fecha_emision": f_emision_com.isoformat(),
+                        "inicio_semana": f_lunes.isoformat(),
                         "lat": g_sel["lat"],
                         "ot_num": str(g_sel["ot_num"] or ""),
                         "cuadrilla_base": cuad_base,
@@ -771,29 +711,28 @@ with tab_comisiones:
                         "rendicion_realizada": False
                     }
 
-                    sb.table("comisiones_servicio").insert(nueva_com).execute()
-                    update_config({"ultimo_nro_comision": int(nro_com_nuevo)})
-                    sb.table("programacion_semanal").update({"comision_generada": True}).eq("id_semana", id_semana_actual).eq("jefe_trabajo", g_sel["jefe_trabajo"]).eq("lat", g_sel["lat"]).execute()
-
-                    st.toast(f"¡Comisión N° {nro_com_nuevo} generada correctamente!", icon="🎉")
-                    st.rerun()
+                    try:
+                        sb.table("comisiones_servicio").insert(nueva_com).execute()
+                        update_config({"ultimo_nro_comision": int(nro_com_nuevo)})
+                        sb.table("programacion_semanal").update({"comision_generada": True}).eq("id_semana", id_semana_actual).eq("jefe_trabajo", g_sel["jefe_trabajo"]).eq("lat", g_sel["lat"]).execute()
+                        st.toast(f"¡Comisión N° {nro_com_nuevo} generada correctamente!", icon="🎉")
+                        st.rerun()
+                    except Exception as e_com:
+                        st.error(f"Error guardando comisión: {e_com}")
 
     st.divider()
 
-    # Listado de Comisiones Emitidas en la Semana + Descarga PDF + Email Contable
     res_coms = sb.table("comisiones_servicio").select("*").eq("id_semana", id_semana_actual).order("nro_comision").execute()
     lista_coms = res_coms.data if res_coms.data else []
 
     if lista_coms:
         st.markdown(f"#### 📂 Comisiones Emitidas — Semana {sem_sel} ({len(lista_coms)} comisiones)")
-        pdfs_para_mail = []
         bloques_texto_mail = []
 
         for c in lista_coms:
             pdf_bytes = generar_pdf_comision(c, cfg["solicitante_default"], cfg["autorizante_default"])
             apellido_jt = str(c["jefe_trabajo"]).split()[0]
             nombre_pdf = f"SEM {c['semana']} - {c['lat']} - {apellido_jt}.pdf"
-            pdfs_para_mail.append((nombre_pdf, pdf_bytes))
 
             bloques_texto_mail.append(
                 f"Comisión {c['nro_comision']}\n"
@@ -821,14 +760,14 @@ with tab_comisiones:
                     sb.table("comisiones_servicio").delete().eq("id", c["id"]).execute()
                     st.rerun()
 
-        with st.expander("📧 Disparar Email de Pedidos de Viáticos al Área Contable", expanded=True):
+        with st.expander("📋 Texto Listo para Correo Contable (Copiar y Pegar en Outlook)", expanded=True):
             ce1, ce2 = st.columns(2)
             with ce1:
-                to_cont = st.text_input("Para (Contable):", value=DESTINATARIOS_CONTABLE_DEFAULT, key="to_contable")
+                st.text_input("Para (Contable):", value=DESTINATARIOS_CONTABLE_DEFAULT, key="to_contable")
             with ce2:
-                cc_cont = st.text_input("CC:", value="Oscar Ignacio Orellana", key="cc_contable")
+                st.text_input("CC:", value="Oscar Ignacio Orellana", key="cc_contable")
 
-            asunto_cont = st.text_input("Asunto:", value=f"Pedidos de viáticos - Semana {sem_sel}", key="asunto_contable")
+            st.text_input("Asunto:", value=f"Pedidos de viáticos - Semana {sem_sel}", key="asunto_contable")
             cuerpo_cont_default = (
                 f"Estimados, buenos días.\n\n"
                 f"Envío los pedidos de comisiones para la semana {sem_sel} de acuerdo con la programación:\n\n"
@@ -836,14 +775,7 @@ with tab_comisiones:
                 f"\nQuedo a su disposición, saludos cordiales.\n\n"
                 f"{cfg['solicitante_default']}\nGerencia de Mantenimiento - Mantenimiento de Líneas"
             )
-            cuerpo_cont = st.text_area("Cuerpo del correo:", value=cuerpo_cont_default, height=240, key="body_contable")
-
-            if st.button("📨 Enviar Correo con Todos los PDFs Adjuntos", type="primary", use_container_width=True):
-                ok_c, msg_c = enviar_correo_smtp(to_cont, cc_cont, asunto_cont, cuerpo_cont, pdfs_para_mail)
-                if ok_c:
-                    st.success(msg_c)
-                else:
-                    st.warning(f"{msg_c} (Descargá los PDFs de arriba y pegá este texto en Outlook).")
+            st.text_area("Cuerpo del correo:", value=cuerpo_cont_default, height=240, key="body_contable")
 
 # =============================================================================
 # PESTAÑA 3: RENDICIÓN DE GASTOS DE VIAJE (SEMANA SIGUIENTE)
@@ -876,7 +808,6 @@ with tab_rendiciones:
             with rc4:
                 veh_ren = st.text_input("Vehículo Utilizado", value=com_sel_ren["vehiculo_1"])
 
-            # Tramos de Salida y Llegada (Ida y Vuelta)
             st.markdown("##### 🚐 Desarrollo de la Comisión (Itinerario Real de Salida y Llegada)")
             dt_ini_c = datetime.strptime(str(com_sel_ren["inicio_semana"])[:10], "%Y-%m-%d").date()
             dt_fin_c = dt_ini_c + timedelta(days=4)
@@ -889,7 +820,6 @@ with tab_rendiciones:
             ])
             df_tramos_ed = st.data_editor(df_tramos_init, num_rows="dynamic", use_container_width=True, key="ed_tramos_ren")
 
-            # Detalle de gastos (Viáticos reales + Peajes + Combustible/Otros)
             st.markdown("##### 💵 Detalle de Gastos (Viáticos Reales + Peajes + Comprobantes)")
             cant_ag_ren = len(com_sel_ren["agentes_json"])
             df_gastos_init = pd.DataFrame([
@@ -931,7 +861,7 @@ with tab_rendiciones:
                     "comision_id": com_sel_ren["id"],
                     "nro_comision": com_sel_ren["nro_comision"],
                     "anio": com_sel_ren["anio"],
-                    "fecha_rendicion": str(f_ren_fecha),
+                    "fecha_rendicion": f_ren_fecha.isoformat(),
                     "localidad_base": loc_base_ren,
                     "jefe_trabajo": com_sel_ren["jefe_trabajo"],
                     "vehiculo": veh_ren,
@@ -942,14 +872,15 @@ with tab_rendiciones:
                     "diferencia_vs_comision": round(dif_calc, 2),
                     "observaciones": obs_ren
                 }
-                sb.table("rendiciones_gastos").insert(nueva_ren).execute()
-                sb.table("comisiones_servicio").update({"rendicion_realizada": True, "estado": "Rendida"}).eq("id", com_sel_ren["id"]).execute()
-                update_config({"ultimo_nro_rendicion": int(nro_ren_nuevo)})
+                try:
+                    sb.table("rendiciones_gastos").insert(nueva_ren).execute()
+                    sb.table("comisiones_servicio").update({"rendicion_realizada": True, "estado": "Rendida"}).eq("id", com_sel_ren["id"]).execute()
+                    update_config({"ultimo_nro_rendicion": int(nro_ren_nuevo)})
+                    st.toast(f"¡Rendición N° {nro_ren_nuevo} guardada!", icon="✅")
+                    st.rerun()
+                except Exception as e_ren:
+                    st.error(f"Error guardando rendición: {e_ren}")
 
-                st.toast(f"¡Rendición N° {nro_ren_nuevo} guardada!", icon="✅")
-                st.rerun()
-
-    # Historial de Rendiciones Guardadas
     res_rens = sb.table("rendiciones_gastos").select("*").order("nro_rendicion", desc=True).limit(20).execute()
     if res_rens.data:
         st.divider()
